@@ -1,6 +1,4 @@
-运行指令：
-
-Anaconda Prompt:
+Anaconda Prompt的运行指令:
 
 cd /d C:\...\lean-playground
 
