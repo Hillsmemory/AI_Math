@@ -1,3 +1,18 @@
 /.lake
 /.cache
 leantar.exe
+
+# Lean 编译临时文件（compiler.py 生成，正常会自动删除）
+_tmp_compile_*.lean
+_tmp_compile_*.olean
+_tmp_compile_*.ilean
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
