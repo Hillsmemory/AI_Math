@@ -14,4 +14,4 @@ streamlit run app\app.py
 ！！拉Mathlib预编译缓存时，按lake-manifest.json锁定的版本拉取 Mathlib 源码（不要用lake update，会把mathlib更新到最新master，和大家的版本不一致）
 
 
-拉取合并请求(Pull Request)时，请用压缩合并(Squash and merge)，这样main不会堆满零碎历史commit
+拉取请求(Pull Request)时，请用压缩合并(Squash and merge)，这样main不会堆满零碎历史commit
