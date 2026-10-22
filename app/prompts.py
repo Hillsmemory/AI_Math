@@ -114,9 +114,10 @@ def get_system_prompt(has_mathlib: bool) -> str:
     return SYSTEM_PROMPT_WITH_MATHLIB if has_mathlib else SYSTEM_PROMPT_NO_MATHLIB
 
 
-# ============ Few-shot 示例（3 个不同类型） ============
+# ============ Few-shot 示例（按有无 Mathlib 分两套） ============
 
-FEW_SHOT_EXAMPLES = [
+# Mathlib 版本（完整模式）
+FEW_SHOT_EXAMPLES_WITH_MATHLIB = [
     # 代数题：加法交换律
     {
         "input": "证明：对任意自然数 a 和 b，a + b = b + a",
@@ -172,16 +173,53 @@ theorem union_comm {α : Type*} (A B : Set α) : A ∪ B = B ∪ A := by
     },
 ]
 
+# 核心库版本（禁止 import Mathlib）
+FEW_SHOT_EXAMPLES_NO_MATHLIB = [
+    # 代数题：加法零元
+    {
+        "input": "证明：对任意自然数 n，n + 0 = n",
+        "output": """```lean
+theorem add_zero_self (n : Nat) : n + 0 = n := by
+  rw [Nat.add_zero]
+```"""
+    },
+    # 代数题：乘法零元
+    {
+        "input": "证明：对任意自然数 n，n * 0 = 0",
+        "output": """```lean
+theorem mul_zero_self (n : Nat) : n * 0 = 0 := by
+  exact Nat.mul_zero n
+```"""
+    },
+    # 命题逻辑：合取交换（term 模式）
+    {
+        "input": "证明：对任意命题 p 和 q，p ∧ q 蕴含 q ∧ p",
+        "output": """```lean
+theorem and_swap (p q : Prop) (h : p ∧ q) : q ∧ p := by
+  exact ⟨h.2, h.1⟩
+```"""
+    },
+]
+
+# 向后兼容：默认返回 Mathlib 版本
+FEW_SHOT_EXAMPLES = FEW_SHOT_EXAMPLES_WITH_MATHLIB
+
+
+def get_few_shot_examples(has_mathlib: bool) -> list[dict]:
+    """根据 Mathlib 可用性返回对应的 Few-shot 示例"""
+    return FEW_SHOT_EXAMPLES_WITH_MATHLIB if has_mathlib else FEW_SHOT_EXAMPLES_NO_MATHLIB
+
 
 # ============ 提示词构造函数 ============
 
-def build_user_prompt(user_input: str, use_few_shot: bool = True) -> str:
+def build_user_prompt(user_input: str, use_few_shot: bool = True, has_mathlib: bool = True) -> str:
     """构造首轮用户提示词"""
     prompt = ""
 
     if use_few_shot:
+        examples = get_few_shot_examples(has_mathlib)
         prompt += "以下是一些示例，供你参考写法：\n\n"
-        for i, ex in enumerate(FEW_SHOT_EXAMPLES, 1):
+        for i, ex in enumerate(examples, 1):
             prompt += f"【示例 {i}】\n输入: {ex['input']}\n输出:\n{ex['output']}\n\n"
         prompt += "---\n\n"
 
@@ -259,3 +297,106 @@ def extract_code_from_response(response: str) -> tuple[str, str]:
             explanation = pre.split("\n")[-1].strip()
 
     return code, explanation
+
+
+# ============ 定理检索：LLM 候选兜底 ============
+
+THEOREM_CANDIDATES_SYSTEM = """你是 Lean4 Mathlib 定理索引专家。
+用户会用自然语言描述一个数学定理或性质，你需要给出 Mathlib4 中最可能对应的定理全名。
+
+规则：
+1. 只输出 Mathlib4 中真实存在的声明全名（如 `Nat.Prime.dvd_mul`、`Set.mem_union`）
+2. 按可能性从高到低排列，最多 8 个
+3. 严格输出 JSON 数组，不要输出任何其他文字，例如：
+["add_comm", "Nat.add_comm"]
+4. 若完全不确定，输出空数组 []"""
+
+
+def build_theorem_candidates_prompt(query: str) -> str:
+    """构造"给 LLM 找候选定理名"的用户提示词"""
+    return f"请给出与下述描述对应的 Mathlib4 定理全名候选列表（JSON 数组）：\n\n{query.strip()}"
+
+
+def extract_theorem_candidates(response: str) -> list[str]:
+    """从 LLM 响应中解析候选定理名 JSON 数组（容忍代码块包裹）"""
+    import json
+    import re
+
+    text = response.strip()
+    # 去掉可能的 ```json ... ``` 包裹
+    m = re.search(r"\[[\s\S]*?\]", text)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    names = []
+    for item in data:
+        if isinstance(item, str) and re.fullmatch(r"[A-Za-z][\w.']{1,80}", item.strip()):
+            names.append(item.strip())
+    # 去重保序
+    seen, uniq = set(), []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq[:8]
+
+
+# ============ 定理形式化翻译（陈述级，sorry 占位） ============
+
+FORMALIZE_SYSTEM = """你是 Lean4 形式化数学专家。你的任务是：给定一个自然语言数学命题，以及若干【已经过 Lean 内核验证】的 Mathlib 定理签名，把该命题翻译成一条 Lean4 theorem 陈述。
+
+## 严格规则
+1. 只翻译"陈述"（statement），证明体一律用 `by sorry` 占位——本步骤验证的是陈述是否形式化正确，不是证明
+2. 引用定理时**只能使用下方提供的签名中的名字**，禁止臆造任何 Mathlib 定理名
+3. 代码第一行必须是 `import Mathlib`
+4. 使用规范的 Mathlib4 记号：ℕ ℤ ℝ、`≤`、`∈`、`∀`、`∃`、`∣`（整除）、`¬`、`∧`、`∨`、`→`、`↔`
+5. 类型注解要完整：变量写在 theorem 的参数表中，前提条件写成假设
+6. 输出格式：先一行中文说明翻译思路，然后 ```lean 代码块```，代码块内只有 import 与一条 theorem 声明"""
+
+
+def build_formalize_prompt(
+    statement: str,
+    verified: dict[str, str],
+    extra_hint: str = "",
+) -> str:
+    """
+    构造形式化翻译的用户提示词。
+    statement: 自然语言命题
+    verified:  {mathlib_id: 内核验证过的签名} —— 只包含 #check 通过的条目
+    extra_hint: 可选补充说明
+    """
+    sig_block = "\n".join(f"- `{name}` : {sig}" for name, sig in verified.items()) or "（本次没有可用的已验证定理签名，请仅用 Lean/Mathlib 基础记号直接翻译命题本身）"
+    hint = f"\n\n补充说明：{extra_hint}" if extra_hint else ""
+    return f"""## 待形式化的命题
+{statement.strip()}
+{hint}
+
+## 已经 Lean 内核验证的定理签名（只允许引用这些）
+{sig_block}
+
+请输出该命题的 Lean4 theorem 陈述（证明用 `by sorry` 占位）。"""
+
+
+def build_formalize_fix_prompt(prev_code: str, errors: list[str]) -> str:
+    """形式化陈述编译失败时的修正提示词"""
+    err_text = "\n".join(f"- {e}" for e in errors) if errors else "（无明确错误行）"
+    return f"""上面的 Lean4 陈述编译失败，请根据报错修复。
+
+## 上次代码
+```lean
+{prev_code}
+```
+
+## 编译报错
+{err_text}
+
+## 修复要求
+1. 保持命题语义不变，只修复语法/类型错误
+2. 仍然只允许引用之前提供的已验证定理名
+3. 证明体保持 `by sorry`
+4. 输出一行中文修复说明 + ```lean 代码块```"""

@@ -72,7 +72,7 @@ class ProofAgent:
             # 1. 生成代码（首轮 vs 修正轮）
             sys_prompt = get_system_prompt(self.compiler.has_mathlib)
             if round_num == 1:
-                user_prompt = build_user_prompt(user_input, self.use_few_shot)
+                user_prompt = build_user_prompt(user_input, self.use_few_shot, self.compiler.has_mathlib)
                 response = self.llm.chat(sys_prompt, user_prompt)
                 current_code, current_explanation = extract_code_from_response(response)
                 if not current_code:
