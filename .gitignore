@@ -16,3 +16,6 @@ venv/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本地记住的 API Key（切勿提交）
+app/.api_keys.json
