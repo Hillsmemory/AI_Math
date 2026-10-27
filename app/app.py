@@ -3,6 +3,7 @@ NLP-to-Lean4 辅助证明助手
 Streamlit 主入口
 
 Tab1 命题生成：中文命题 → LLM + 编译反馈闭环 → 可编译 Lean4 证明
+Tab1.5 结构化形式化：中文命题 → 高可读结构化 Lean4 证明（中文分步注释/命名中间结论/方法总结）
 Tab2 证明翻译：Lean4 theorem → 结构化中文讲解
 Tab3 证明检查：静态清单 + 真实编译 + #print axioms 伪证明检测
 Tab4 项目管理：.lean 扫描 / sorry 定位 / lake build / AI 诊断
@@ -11,9 +12,11 @@ Tab5 定理检索与形式化：本地知识库加权检索 → LLM 候选兜底
 启动：streamlit run app.py
 """
 
+import base64
 import json
 import os
 import sys
+import threading
 
 import pandas as pd
 import streamlit as st
@@ -31,7 +34,7 @@ from checker_agent import (
     SAMPLE_CHECK_CODE,
 )
 from compiler import LeanCompiler
-from llm_client import LLMClient, PRESET_MODELS
+from llm_client import LLMClient, PRESET_MODELS, model_supports_vision
 from project_manager import (
     ProjectManager, ProjectScan, BuildReport,
     build_advisor_prompt, PROJECT_ADVISOR_SYSTEM_PROMPT,
@@ -55,9 +58,274 @@ st.set_page_config(
     page_title="NLP-to-Lean4 辅助证明助手",
     page_icon="∮",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 _WS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ============ API Key 本地持久化（刷新/重启/换目录启动都不丢） ============
+# 存储位置移到用户目录（%APPDATA%），不再放在仓库里，
+# 避免 git clean、删仓库重克隆、同步盘回滚等操作把 Key 一并带走。
+
+_KEYS_DIR = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "nlp-lean4"
+)
+_KEYS_FILE = os.path.join(_KEYS_DIR, "api_keys.json")
+# 旧位置（仓库内），首次运行时自动迁移
+_LEGACY_KEYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".api_keys.json")
+
+
+def _load_saved_keys() -> dict:
+    """读取本地保存的 API Key 映射 {env_key: key}（含旧位置一次性迁移）"""
+    def _read(path: str) -> dict | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    data = _read(_KEYS_FILE)
+    if data is None and os.path.exists(_LEGACY_KEYS_FILE):
+        old = _read(_LEGACY_KEYS_FILE)
+        if old:
+            _write_keys(old)  # 迁移旧文件到新位置
+            return old
+    return data or {}
+
+
+def _write_keys(data: dict):
+    """原子写入：先写临时文件再 os.replace，避免半截文件覆盖旧数据"""
+    try:
+        os.makedirs(_KEYS_DIR, exist_ok=True)
+        tmp = _KEYS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, _KEYS_FILE)
+    except OSError:
+        pass
+
+
+def _save_key(env_key: str, key: str):
+    """把 API Key 合并写入用户目录的存储文件（不在仓库内，不会进版本库）"""
+    _write_keys({**_load_saved_keys(), env_key: key})
+
+
+def _remove_key(env_key: str):
+    """删除本地保存的某个 API Key"""
+    data = _load_saved_keys()
+    data.pop(env_key, None)
+    _write_keys(data)
+
+
+def _save_active_key(env_key: str):
+    """记住当前激活的 API Key（刷新页面后仍选中它）"""
+    _write_keys({**_load_saved_keys(), "_active_key": env_key})
+
+
+def _save_model_choice(env_key: str, model: str):
+    """记住每把 Key 下用户选的模型（一键一模型，互不影响）"""
+    data = _load_saved_keys()
+    models = data.get("_models")
+    if not isinstance(models, dict):
+        models = {}
+    if models.get(env_key) == model:
+        return
+    models[env_key] = model
+    data["_models"] = models
+    _write_keys(data)
+
+
+# ============ 图片上传辅助（供支持视觉的模型读取） ============
+
+def _encode_images(files) -> list[str]:
+    """把 Streamlit 上传的图片文件转成 data URL 列表"""
+    urls: list[str] = []
+    for f in files or []:
+        try:
+            raw = f.read()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        mime = getattr(f, "type", None) or "image/png"
+        b64 = base64.b64encode(raw).decode("ascii")
+        urls.append(f"data:{mime};base64,{b64}")
+    return urls
+
+
+def image_uploader(key: str, model: str) -> list[str]:
+    """渲染图片上传控件。
+    - 模型不支持视觉时：提示并忽略图片，返回空列表
+    - 返回当前选中图片的 data URL 列表
+    """
+    files = st.file_uploader(
+        "📷 附加图片（可选，供支持视觉的模型读取，如手写题目/图表）",
+        type=["png", "jpg", "jpeg", "webp", "gif"],
+        accept_multiple_files=True,
+        key=key,
+    )
+    if not files:
+        return []
+    if not model_supports_vision(model):
+        st.warning(
+            f"当前模型 **{model}** 不支持读取图片，已上传的图片将被忽略。"
+            "如需读图，请在侧边栏改用 GPT-4o / GPT-4o Mini 或 Qwen VL Max（视觉）。",
+            icon="🖼️",
+        )
+        return []
+    return _encode_images(files)
+
+
+# ============ 后台任务运行器（让长任务可"随时取消"） ============
+# Streamlit 脚本运行期间按钮点击会被排队，无法即时打断。
+# 方案：Agent 闭环放到后台线程，界面用 st.fragment 定时轮询渲染进度，
+# 「⏹ 停止」按钮在 fragment 内即时响应，置位取消标志，Agent 在最近安全点中止。
+
+_RUNS: dict[str, dict] = {}
+
+
+def _start_run(run_key: str, agent: ProofAgent, input_text: str, images: list[str] | None):
+    """后台线程启动 Agent 闭环"""
+    cancel = threading.Event()
+    state = {
+        "progress": [],          # 只存阶段转换 (round, status)
+        "compile_heartbeat": None,  # 编译心跳 (round, secs)，原地更新不堆叠
+        "result": None,
+        "error": None,
+        "done": False,
+        "cancel": cancel,
+    }
+    _RUNS[run_key] = state
+
+    def _on_progress(r, _i, s, detail=None):
+        # detail 非 None 表示编译心跳：原地更新秒数，不往列表里堆重复行
+        if detail is not None:
+            state["compile_heartbeat"] = (r, detail)
+        else:
+            state["progress"].append((r, s))
+            state["compile_heartbeat"] = None  # 新阶段开始，清空上次心跳
+
+    def work():
+        try:
+            state["result"] = agent.run(
+                input_text,
+                on_progress=_on_progress,
+                images=images,
+                should_stop=cancel.is_set,
+            )
+        except Exception as e:
+            state["error"] = str(e)
+        finally:
+            state["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _render_live_run(run_key: str, result_key: str, label: str):
+    """轮询渲染运行状态 + 停止按钮；完成后把结果写入 session_state 并整页重跑"""
+    state = _RUNS.get(run_key)
+    if not state:
+        return
+
+    @st.fragment(run_every=2)
+    def _watch():
+        if state["done"]:
+            _RUNS.pop(run_key, None)
+            if state["error"]:
+                st.session_state[f"{result_key}_err"] = state["error"]
+                st.session_state[result_key] = None
+            else:
+                st.session_state[result_key] = state["result"]
+            st.rerun()
+
+        with st.status(label, expanded=True, state="running"):
+            # progress 只含阶段转换 (round, status)；编译心跳单独原地更新
+            for r, s in state["progress"]:
+                if s == "generating":
+                    st.write(f"🔄 第 {r} 轮：调用 LLM {'生成' if r == 1 else '修正'}代码...")
+                elif s == "compiling":
+                    hb = state.get("compile_heartbeat")
+                    if hb and hb[0] == r:
+                        secs = hb[1]
+                        extra = "（这条提示会原地更新秒数，不代表卡住）" if secs >= 60 else ""
+                        st.write(f"⚙️ 第 {r} 轮：Lean 编译检查中... 已等待 {secs} 秒{extra}")
+                    else:
+                        st.write(f"⚙️ 第 {r} 轮：Lean 编译检查中...")
+        if st.button("⏹ 停止", key=f"stop_{run_key}"):
+            state["cancel"].set()
+            st.toast("已请求停止，将在当前步骤结束后取消", icon="⏹")
+
+    _watch()
+
+
+# ============ 后台检查运行器（证明检查：编译心跳 + 实时进度） ============
+
+def _start_check_run(run_key: str, checker, code: str, use_llm_review: bool, images: list[str] | None):
+    """后台线程启动证明检查；checker.check 的 on_progress 把阶段与编译心跳写进 state"""
+    state = {
+        "progress": [],            # 阶段列表 ["static", "compiling", "llm"]
+        "compile_heartbeat": None,  # 编译心跳秒数
+        "result": None,
+        "error": None,
+        "done": False,
+    }
+    _RUNS[run_key] = state
+
+    def _on_progress(status, detail=None):
+        if detail is not None:
+            state["compile_heartbeat"] = detail
+        else:
+            state["progress"].append(status)
+            state["compile_heartbeat"] = None
+
+    def work():
+        try:
+            state["result"] = checker.check(
+                code,
+                use_llm_review=use_llm_review,
+                images=images,
+                on_progress=_on_progress,
+            )
+        except Exception as e:
+            state["error"] = str(e)
+        finally:
+            state["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _render_check_run(run_key: str, result_key: str, label: str):
+    """轮询渲染证明检查进度；完成后写入 session_state 并整页重跑"""
+    state = _RUNS.get(run_key)
+    if not state:
+        return
+
+    @st.fragment(run_every=2)
+    def _watch():
+        if state["done"]:
+            _RUNS.pop(run_key, None)
+            if state["error"]:
+                st.session_state[f"{result_key}_err"] = state["error"]
+                st.session_state[result_key] = None
+            else:
+                st.session_state[result_key] = state["result"]
+            st.rerun()
+
+        with st.status(label, expanded=True, state="running"):
+            for s in state["progress"]:
+                if s == "static":
+                    st.write("🧪 执行静态检查清单...")
+                elif s == "compiling":
+                    hb = state.get("compile_heartbeat")
+                    if hb is not None:
+                        st.write(f"⚙️ Lean 编译检查中... 已等待 {hb} 秒（Mathlib 首次加载可能较慢）")
+                    else:
+                        st.write("⚙️ Lean 编译检查中...")
+                elif s == "llm":
+                    st.write("🤖 LLM 深度审查中...")
+
+    _watch()
 
 
 @st.cache_data(show_spinner=False)
@@ -87,6 +355,10 @@ if "lean_compiler" not in st.session_state:
     st.session_state.lean_compiler = LeanCompiler()
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
+if "struct_result" not in st.session_state:
+    st.session_state.struct_result = None
+if "check_result" not in st.session_state:
+    st.session_state.check_result = None
 # 定理检索相关：签名缓存 / 检索结果 / 形式化结果
 if "thm_sig_cache" not in st.session_state:
     st.session_state.thm_sig_cache = {}
@@ -116,25 +388,128 @@ else:
 with st.sidebar:
     st.header("⚙️ 设置")
 
-    # 模型选择
+    # ---- 多 API 配置：一把 Key 一个配置项，点选 Key 后再选其下模型 ----
+    st.subheader("🔑 API 配置")
+    _saved_keys = _load_saved_keys()
     model_keys = list(PRESET_MODELS.keys())
-    default_idx = model_keys.index("deepseek-chat") if "deepseek-chat" in model_keys else 0
-    model_name = st.selectbox(
-        "LLM 模型",
-        options=model_keys,
-        index=default_idx,
-        format_func=lambda k: f"{k} - {PRESET_MODELS[k]['label']}",
-        help="选择要使用的大模型。留空 API Key 可使用演示模式",
-    )
 
-    # API Key 输入
-    api_key = st.text_input(
-        "API Key",
-        value=os.getenv(PRESET_MODELS[model_name]["env_key"], ""),
-        type="password",
-        placeholder="留空则使用演示模式",
-        help="Key 仅本次会话使用，不会上传",
-    )
+    # 服务商显示名（按 Key 的环境变量名分组）
+    _PROVIDER_NAMES = {
+        "OPENAI_API_KEY": "OpenAI",
+        "DEEPSEEK_API_KEY": "DeepSeek",
+        "QWEN_API_KEY": "通义千问",
+        "MOONSHOT_API_KEY": "Kimi",
+    }
+
+    def _key_for(env_key: str) -> str:
+        """本地记忆优先，其次环境变量"""
+        return _saved_keys.get(env_key, "") or os.getenv(env_key, "")
+
+    def _mask(k: str) -> str:
+        return k if len(k) <= 8 else f"{k[:4]}…{k[-4:]}"
+
+    # 按 PRESET_MODELS 声明顺序，把模型归组到各自的 Key 下
+    _env_order: list[str] = []
+    _env_models: dict[str, list[str]] = {}
+    for _m in model_keys:
+        _e = PRESET_MODELS[_m]["env_key"]
+        if _e not in _env_models:
+            _env_models[_e] = []
+            _env_order.append(_e)
+        _env_models[_e].append(_m)
+
+    # 已配置 Key 的服务商：一把 Key = 一个配置项
+    configured_envs = [e for e in _env_order if _key_for(e)]
+
+    # 激活 Key：优先上次点选的；兼容旧字段（_active 曾存模型名）
+    _active_env = _saved_keys.get("_active_key", "")
+    if _active_env not in configured_envs:
+        _old = _saved_keys.get("_active", "")
+        if _old in PRESET_MODELS and PRESET_MODELS[_old]["env_key"] in configured_envs:
+            _active_env = PRESET_MODELS[_old]["env_key"]
+    if _active_env not in configured_envs:
+        _active_env = ""
+
+    if configured_envs:
+        _default_env = (
+            _active_env
+            or ("DEEPSEEK_API_KEY" if "DEEPSEEK_API_KEY" in configured_envs else configured_envs[0])
+        )
+        active_env = st.radio(
+            "当前使用的 API Key（点选切换）",
+            options=configured_envs,
+            index=configured_envs.index(_default_env),
+            format_func=lambda e: f"{_PROVIDER_NAMES.get(e, e)} · {_mask(_key_for(e))}",
+            key="api_active_env",
+        )
+        if active_env != _saved_keys.get("_active_key"):
+            _save_active_key(active_env)
+
+        # 第二级：这把 Key 下可用的模型，记住各自上次的选择
+        _ms = _env_models[active_env]
+        _models_pref = _saved_keys.get("_models")
+        _pref = _models_pref.get(active_env, "") if isinstance(_models_pref, dict) else ""
+        if _pref not in _ms and _saved_keys.get("_active", "") in _ms:
+            _pref = _saved_keys["_active"]  # 首次迁移：沿用旧字段记住的模型
+        model_name = st.selectbox(
+            "使用的模型",
+            options=_ms,
+            index=_ms.index(_pref) if _pref in _ms else 0,
+            format_func=lambda k: PRESET_MODELS[k]["label"],
+            key=f"api_model_{active_env}",
+        )
+        _save_model_choice(active_env, model_name)
+    else:
+        _default_model = "deepseek-chat" if "deepseek-chat" in model_keys else model_keys[0]
+        model_name = st.selectbox(
+            "LLM 模型",
+            options=model_keys,
+            index=model_keys.index(_default_model),
+            format_func=lambda k: f"{k} - {PRESET_MODELS[k]['label']}",
+            help="尚未配置任何 API Key：可在下方「管理 API Key」添加，或直接使用演示模式",
+        )
+
+    # 当前激活模型的可用 Key
+    api_key = _key_for(PRESET_MODELS[model_name]["env_key"])
+
+    # ---- 管理 API Key：按服务商增删 Key ----
+    with st.expander("🗂 管理 API Key", expanded=not configured_envs):
+        manage_env = st.selectbox(
+            "服务商（一把 Key 一个账号）",
+            options=_env_order,
+            index=_env_order.index("DEEPSEEK_API_KEY") if "DEEPSEEK_API_KEY" in _env_order else 0,
+            format_func=lambda e: f"{_PROVIDER_NAMES.get(e, e)}（{_env_models[e][0]} 等 {len(_env_models[e])} 个模型）",
+            key="api_manage_env",
+        )
+        _m_cur = _key_for(manage_env)
+        if _m_cur:
+            _src = "本地记忆" if _saved_keys.get(manage_env) else "环境变量"
+            st.caption(f"当前可用：`{_mask(_m_cur)}`（来自{_src}）")
+        new_key = st.text_input(
+            "新 API Key",
+            type="password",
+            placeholder=f"填入 {manage_env} 的 Key",
+            key="api_manage_key",
+        )
+        col_save, col_del = st.columns(2)
+        with col_save:
+            if st.button("💾 保存并启用", use_container_width=True, key="api_save"):
+                k = (new_key or "").strip()
+                if not k:
+                    st.warning("请先输入 Key")
+                else:
+                    _save_key(manage_env, k)
+                    _save_active_key(manage_env)
+                    st.rerun()
+        with col_del:
+            if st.button("🗑 删除本地 Key", use_container_width=True, key="api_del"):
+                if _saved_keys.get(manage_env):
+                    _remove_key(manage_env)
+                    if "api_active_env" in st.session_state:
+                        del st.session_state["api_active_env"]
+                    st.rerun()
+                else:
+                    st.info("该服务商没有本地保存的 Key（可能来自环境变量，无法在此删除）")
 
     # 高级参数
     max_iter = st.slider("最大迭代次数", min_value=1, max_value=10, value=5, step=1)
@@ -166,8 +541,8 @@ with st.sidebar:
 
 # ============ Tab 结构 ============
 
-tab_gen, tab_trans, tab_chk, tab_proj, tab_theorem = st.tabs(
-    ["🪄 命题生成", "📖 证明翻译", "🔍 证明检查", "📁 项目管理", "📚 定理检索与形式化"]
+tab_gen, tab_struct, tab_trans, tab_chk, tab_proj, tab_theorem = st.tabs(
+    ["🪄 命题证明", "📐 结构化形式化", "📖 证明翻译", "🔍 证明检查", "📁 项目管理", "📚 定理检索与形式化"]
 )
 
 
@@ -183,6 +558,8 @@ with tab_gen:
         label_visibility="collapsed",
         key="gen_user_input",
     )
+
+    gen_images = image_uploader("gen_images", model_name)
 
     col_run, col_hint = st.columns([1, 3])
     with col_run:
@@ -203,39 +580,17 @@ with tab_gen:
         return result
 
 
-    def execute_real(input_text: str, model: str, key: str, max_iter: int, few_shot: bool):
-        """真实模式：调用 LLM + 编译器"""
-        with st.status("调用 LLM 生成 Lean4 代码...", expanded=True) as status:
-            try:
-                st.write(f"🔌 连接模型：{model}")
-                llm = LLMClient.from_preset(model, api_key=key)
-
-                agent = ProofAgent(
-                    llm_client=llm,
-                    compiler=st.session_state.lean_compiler,
-                    max_iterations=max_iter,
-                    use_few_shot=few_shot,
-                )
-
-                # 进度回调
-                def on_progress(round_num, _iter, status_text):
-                    if status_text == "generating":
-                        st.write(f"🔄 第 {round_num} 轮：调用 LLM {'生成' if round_num == 1 else '修正'}代码...")
-                    elif status_text == "compiling":
-                        st.write(f"⚙️ 第 {round_num} 轮：编译检查中...")
-
-                st.write("🤖 启动 Agent 反馈闭环")
-                result = agent.run(input_text, on_progress=on_progress)
-
-                if result.success:
-                    status.update(label=f"✅ 编译通过（{result.total_rounds} 轮）", state="complete")
-                else:
-                    status.update(label=f"⚠️ 未通过编译（{result.total_rounds} 轮）", state="error")
-                return result
-            except Exception as e:
-                status.update(label=f"❌ 执行失败: {e}", state="error")
-                st.error(f"错误：{e}")
-                return None
+    def _launch(input_text: str, images: list[str] | None, structured: bool, run_key: str):
+        """构造 Agent 并后台启动（可取消）；structured=True 时生成高可读结构化证明"""
+        llm = LLMClient.from_preset(model_name, api_key=api_key)
+        agent = ProofAgent(
+            llm_client=llm,
+            compiler=st.session_state.lean_compiler,
+            max_iterations=max_iter,
+            use_few_shot=use_few_shot,
+            structured=structured,
+        )
+        _start_run(run_key, agent, input_text, images)
 
 
     # 触发执行
@@ -244,8 +599,8 @@ with tab_gen:
     elif demo_btn_even:
         st.session_state.last_result = execute_demo("偶数平方")
     elif run_btn:
-        if not user_input.strip():
-            st.error("请先输入数学命题")
+        if not user_input.strip() and not gen_images:
+            st.error("请先输入数学命题，或上传一张题目图片（需视觉模型）")
         elif not api_key:
             st.info("未填入 API Key，自动进入演示模式")
             demo_key = "加法交换律"
@@ -256,10 +611,20 @@ with tab_gen:
             if not LLMClient.is_available():
                 st.error("未安装 openai 包，请运行：pip install openai")
             else:
-                with st.spinner("执行中..."):
-                    st.session_state.last_result = execute_real(
-                        user_input.strip(), model_name, api_key, max_iter, use_few_shot
+                # 只传图未输文字时，指示模型先读图
+                input_text = user_input.strip()
+                if not input_text and gen_images:
+                    input_text = (
+                        "数学题目见所附图片。请先读取并转录图片中的题目，"
+                        "再将其形式化为 Lean4 定理并给出证明。"
                     )
+                _launch(input_text, gen_images, structured=False, run_key="gen")
+
+    # 后台任务进行中：实时进度 + ⏹ 停止
+    _render_live_run("gen", "last_result", "🤖 Agent 反馈闭环运行中...")
+    _gen_err = st.session_state.pop("last_result_err", None)
+    if _gen_err:
+        st.error(f"错误：{_gen_err}")
 
 
     # ============ 结果展示 ============
@@ -269,7 +634,12 @@ with tab_gen:
         st.divider()
 
         # 摘要
-        if result.pass_compilation:
+        if getattr(result, "cancelled", False):
+            st.warning(
+                f"⏹ **已手动取消**（进行到第 {result.total_rounds} 轮，下方保留已有中间结果）",
+                icon="⏹",
+            )
+        elif result.pass_compilation:
             st.success(
                 f"✅ **编译通过！** 经过 {result.total_rounds} 轮迭代，Lean4 代码编译成功"
                 + ("" if result.lean4_available else "（模拟模式）"),
@@ -339,7 +709,7 @@ with tab_gen:
     if not result:
         st.divider()
         st.markdown("""
-        ### 👋 欢迎使用 — 命题生成
+        ### 👋 欢迎使用 — 命题证明
 
         **使用流程**：
         1. 在上方填入中文数学命题
@@ -350,6 +720,73 @@ with tab_gen:
         """)
     else:
         render_result(result)
+
+
+# =====================================================
+# Tab 1.5：结构化形式化（自然语言 → 高可读结构化 Lean4 证明）
+# =====================================================
+with tab_struct:
+    st.subheader("📐 自然语言 → 结构化 Lean4 证明")
+    st.caption(
+        "生成**可读性极高**的结构化证明：docstring 定理说明、`-- 第 N 步` 中文分步注释、"
+        "命名中间结论、复杂命题拆辅助引理、末尾方法总结；同样经过 Lean 编译修正闭环"
+    )
+
+    struct_input = st.text_area(
+        "在此输入中文自然语言数学命题",
+        height=120,
+        placeholder="例如：证明：若 n 是偶数，则 n² 是 4 的倍数",
+        label_visibility="collapsed",
+        key="struct_user_input",
+    )
+
+    struct_images = image_uploader("struct_images", model_name)
+
+    col_srun, col_shint = st.columns([1, 3])
+    with col_srun:
+        struct_run_btn = st.button("🧩 生成结构化证明", type="primary", use_container_width=True, key="struct_run")
+    with col_shint:
+        st.caption("需要 API Key · 修正轮会保持结构化风格不丢失")
+
+    if struct_run_btn:
+        if not struct_input.strip() and not struct_images:
+            st.error("请先输入数学命题，或上传一张题目图片（需视觉模型）")
+        elif not api_key:
+            st.error("结构化形式化需要真实 LLM，请在侧边栏填写 API Key")
+        elif not LLMClient.is_available():
+            st.error("未安装 openai 包，请运行：pip install openai")
+        else:
+            # 只传图未输文字时，指示模型先读图
+            struct_text = struct_input.strip()
+            if not struct_text and struct_images:
+                struct_text = (
+                    "数学题目见所附图片。请先读取并转录图片中的题目，"
+                    "再将其形式化为高可读结构化 Lean4 证明。"
+                )
+            _launch(struct_text, struct_images, structured=True, run_key="struct")
+
+    # 后台任务进行中：实时进度 + ⏹ 停止
+    _render_live_run("struct", "struct_result", "🧩 结构化证明生成中...")
+    _struct_err = st.session_state.pop("struct_result_err", None)
+    if _struct_err:
+        st.error(f"错误：{_struct_err}")
+
+    struct_result: AgentResult | None = st.session_state.struct_result
+    if struct_result:
+        render_result(struct_result)
+    else:
+        st.divider()
+        st.markdown("""
+        **与「🪄 命题证明」的区别**：同一个编译修正闭环，但强制输出教学级可读结构 ——
+
+        | 要求 | 说明 |
+        | --- | --- |
+        | `/-- ... -/` docstring | 主定理前写清命题的自然语言含义 |
+        | `-- 第 N 步：...` | 每个证明阶段前一行中文注释 |
+        | 命名中间结论 | `have h_name : 命题 := by ...`，拒绝无名长链 |
+        | 辅助引理 | 复杂命题先证 `helper_xxx` 再引用 |
+        | 方法总结 | 代码末尾一行注释概括证明策略 |
+        """)
 
 
 # =====================================================
@@ -396,6 +833,8 @@ theorem even_square_div4 (n : Nat) (h : Even n) : 4 ∣ n ^ 2 := by
         label_visibility="collapsed",
         key="trans_input",
     )
+
+    trans_images = image_uploader("trans_images", model_name)
 
     col_trans_run, col_trans_hint = st.columns([1, 3])
     with col_trans_run:
@@ -453,6 +892,8 @@ theorem even_square_div4 (n : Nat) (h : Even n) : 4 ∣ n ^ 2 := by
             if not LLMClient.is_available():
                 st.error("未安装 openai 包，请运行：pip install openai")
             else:
+                result = None
+                translate_error = None
                 with st.status("调用 LLM 翻译中...", expanded=True) as status:
                     try:
                         llm = LLMClient.from_preset(model_name, api_key=api_key)
@@ -461,15 +902,21 @@ theorem even_square_div4 (n : Nat) (h : Even n) : 4 ∣ n ^ 2 := by
                             mathlib_context=compiler.has_mathlib,
                         )
                         st.write("🔌 已连接模型，开始翻译...")
-                        result = translator.translate(code)
+                        result = translator.translate(code, images=trans_images or None)
                         if result.success:
                             status.update(label="✅ 翻译完成", state="complete")
-                            render_translation(result.markdown, code)
                         else:
                             status.update(label=f"❌ 翻译失败: {result.error}", state="error")
                     except Exception as e:
+                        translate_error = str(e)
                         status.update(label=f"❌ 执行失败: {e}", state="error")
-                        st.error(f"错误：{e}")
+
+                # st.status 底层是一个 expander，不能在其内部再放 expander；
+                # 因此等 status 闭合后、回到顶层再渲染翻译结果（render_translation 内含 expander）
+                if translate_error:
+                    st.error(f"错误：{translate_error}")
+                elif result is not None and result.success:
+                    render_translation(result.markdown, code)
 
 
 # =====================================================
@@ -492,7 +939,7 @@ with tab_chk:
             st.session_state.chk_input = last_result.final_code
             st.info("已填充最近一次生成的代码")
         else:
-            st.warning("暂无生成结果，请先在「命题生成」Tab 运行一次")
+            st.warning("暂无生成结果，请先在「命题证明」Tab 运行一次")
     if prefill_sample:
         st.session_state.chk_input = SAMPLE_CHECK_CODE
         st.info("已填充检查示例（含 sorry，用于演示检查器抓伪证明）")
@@ -506,6 +953,7 @@ with tab_chk:
     )
 
     use_llm_review = st.checkbox("附加 LLM 深度审查（需 API Key）", value=False, key="chk_use_llm")
+    chk_images = image_uploader("chk_images", model_name) if use_llm_review else []
     chk_run_btn = st.button("🔍 开始检查", type="primary", use_container_width=True, key="chk_run")
 
     # 渲染检查结果
@@ -554,12 +1002,18 @@ with tab_chk:
                     do_llm = True
 
             checker = ProofChecker(compiler=st.session_state.lean_compiler, llm_client=llm)
-            with st.status("检查中...", expanded=True) as status:
-                st.write("🧪 执行静态检查清单...")
-                res = checker.check(code, use_llm_review=do_llm)
-                state = "complete" if res.passed else "error"
-                status.update(label=("✅ " if res.passed else "❌ ") + res.summary, state=state)
-            render_check_result(res)
+            _start_check_run("chk", checker, code, do_llm, chk_images or None)
+
+    # 轮询渲染进行中的检查（后台线程 + fragment 心跳，编译期间显示已等待秒数）
+    _render_check_run("chk", "check_result", "🔍 证明检查中...")
+
+    _check_err = st.session_state.pop("check_result_err", None)
+    if _check_err:
+        st.error(f"检查出错：{_check_err}")
+
+    check_res: CheckResult | None = st.session_state.check_result
+    if check_res:
+        render_check_result(check_res)
 
 
 # =====================================================

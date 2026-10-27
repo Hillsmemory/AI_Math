@@ -238,12 +238,16 @@ def build_user_prompt(user_input: str, use_few_shot: bool = True, has_mathlib: b
     return prompt
 
 
-def build_refinement_prompt(prev_code: str, errors: list[str], warnings: list[str] = None) -> str:
+def build_refinement_prompt(prev_code: str, errors: list[str], warnings: list[str] = None,
+                            structured: bool = False) -> str:
     """构造修正轮的提示词（基于编译错误反馈）"""
     err_text = "\n".join(f"- {e}" for e in errors) if errors else "（无明确错误行）"
     warn_text = ""
     if warnings:
         warn_text = "\n警告：\n" + "\n".join(f"- {w}" for w in warnings)
+    style_req = ""
+    if structured:
+        style_req = "\n6. **保持结构化风格**：docstring、`-- 第 N 步：` 中文分步注释、命名中间结论、末尾方法总结注释，均不得因修复而删除"
 
     return f"""上次生成的 Lean4 代码编译失败，请根据报错信息修复代码。
 
@@ -260,7 +264,7 @@ def build_refinement_prompt(prev_code: str, errors: list[str], warnings: list[st
 2. 修复所有错误，确保编译能通过
 3. 不要使用 sorry 或 admit
 4. 仍然使用标准 Mathlib4 库引理
-5. 输出格式：先用一行中文说明修复思路，然后输出 ```lean 代码块```
+5. 输出格式：先用一行中文说明修复思路，然后输出 ```lean 代码块```{style_req}
 
 请直接输出修复后的代码。"""
 
@@ -297,6 +301,106 @@ def extract_code_from_response(response: str) -> tuple[str, str]:
             explanation = pre.split("\n")[-1].strip()
 
     return code, explanation
+
+
+# ============ 结构化形式化（高可读性证明风格） ============
+
+STRUCTURED_ENV_MATHLIB = """## 环境
+本机已安装 Mathlib4：代码第一行写 `import Mathlib`。
+可使用 ℕ ℤ ℝ、`Even`、`∣`、`Set`、`↔` 等 Mathlib 记号，以及 `omega` / `ring` / `ring_nf` / `linarith` / `nlinarith` 等 Mathlib tactic。"""
+
+STRUCTURED_ENV_NO_MATHLIB = """## ⚠ 环境约束
+本机未安装 Mathlib4：**禁止 `import Mathlib`** 与任何 Mathlib 专属定义（Real/Even/∣/Set 等均不可用）。
+只允许 Lean 核心库内容：`Nat`/`Int`/`Rat`/`Bool`/`Prop` 类型、`Nat.*` 引理、
+基础 tactic（`rfl`/`simp`/`rw`/`induction`/`cases`/`exact`/`apply`/`have`/`obtain`）。
+若原命题依赖实数等 Mathlib 概念，改写为核心库上等价且可编译的离散命题，并在 docstring 中注明该改写。"""
+
+STRUCTURED_STYLE_RULES = """## 证明风格要求（高可读结构化，必须全部遵守）
+1. **定理说明**：主定理声明前用 `/-- ... -/` docstring 写清命题的自然语言含义
+2. **分步注释**：证明体按逻辑阶段分块，每一块前必须有一行中文注释 `-- 第 N 步：...` 说明该步目的
+3. **命名中间结论**：关键中间事实写成 `have h_name : 命题 := by ...`，禁止无名长链 tactic
+4. **小步 tactic**：每个 tactic 行只做一件事，保证读者能逐行跟上（`simp`/`omega`/`ring` 等一步到位的自动化简除外，但同样要注释说明它在做什么）
+5. **辅助引理**：命题较复杂时，先在主定理之前证明独立的辅助引理（命名清晰，如 `helper_xxx`），主定理中引用
+6. **方法总结**：代码最后用一行注释 `-- 方法总结：...` 概括整体证明策略
+7. 禁止使用 sorry / admit
+8. 引理名必须真实存在；不确定时优先用基础 tactic（`induction` / `rw` / `simp` / `exact`）"""
+
+STRUCTURED_OUTPUT_RULES = """## 输出格式
+- 只输出一个 ```lean ... ``` 代码块；代码块之前可以用一行中文概括整体证明思路
+- 代码块内包含完整的 import（如需要）、辅助引理与主定理声明及证明"""
+
+STRUCTURED_EXAMPLE_MATHLIB = """```lean
+import Mathlib
+
+/-- 偶数平方整除性：若自然数 n 是偶数，则 n² 能被 4 整除。 -/
+theorem even_square_div4 (n : ℕ) (h : Even n) : 4 ∣ n ^ 2 := by
+  -- 第 1 步：展开偶数定义，取出见证 k 与等式 n = 2 * k
+  obtain ⟨k, hk⟩ := h
+
+  -- 第 2 步：将目标中的 n 替换为 2 * k
+  rw [hk]
+
+  -- 第 3 步：代数展开 (2 * k) ^ 2 为 4 * k ^ 2
+  ring_nf
+
+  -- 第 4 步：4 * k² 显然是 4 的倍数，用标准整除引理收尾
+  exact dvd_mul_right 4 (k ^ 2)
+
+-- 方法总结：展开定义 → 代入 → 代数化简 → 标准整除引理。
+```"""
+
+STRUCTURED_EXAMPLE_NO_MATHLIB = """```lean
+/-- 自然数加法交换律：对任意 a b，a + b = b + a。 -/
+theorem add_comm_self (a b : Nat) : a + b = b + a := by
+  -- 对 a 做数学归纳法
+  induction a with
+  | zero =>
+    -- 基例：0 + b = b，正是核心库引理 Nat.zero_add
+    exact Nat.zero_add b
+  | succ n ih =>
+    -- 归纳步：目标 succ n + b = b + succ n
+    -- 先把左边按定义化为 succ (n + b)
+    rw [Nat.succ_add]
+    -- 用归纳假设把 n + b 换成 b + n
+    rw [ih]
+    -- succ (b + n) = b + succ n 即 Nat.add_succ 的对称形式
+    exact (Nat.add_succ b n).symm
+
+-- 方法总结：归纳法 + 加法定义引理逐步重写。
+```"""
+
+
+def get_structured_system_prompt(has_mathlib: bool) -> str:
+    """结构化形式化的 System Prompt（按环境切换可用资源约束）"""
+    env = STRUCTURED_ENV_MATHLIB if has_mathlib else STRUCTURED_ENV_NO_MATHLIB
+    return f"""你是一名 Lean4 形式化证明专家，擅长把自然语言数学命题翻译成**可读性极高的结构化 Lean4 证明**：每一步都有中文注释、关键中间结论都有命名、复杂命题拆分为辅助引理。
+
+{env}
+
+{STRUCTURED_STYLE_RULES}
+
+{STRUCTURED_OUTPUT_RULES}"""
+
+
+def build_structured_user_prompt(user_input: str, has_mathlib: bool = True) -> str:
+    """构造结构化形式化的首轮用户提示词（含目标风格示例）"""
+    example = STRUCTURED_EXAMPLE_MATHLIB if has_mathlib else STRUCTURED_EXAMPLE_NO_MATHLIB
+    return f"""请参考下面这个"目标风格"示例，把命题翻译成同样高可读结构的 Lean4 证明。
+
+【风格示例】
+{example}
+
+---
+
+请将下面的中文数学命题转换为结构化 Lean4 证明：
+
+命题：{user_input}
+
+要求：
+1. 严格遵守 System Prompt 中的证明风格要求（docstring、分步中文注释、命名中间结论、方法总结）
+2. 用 ```lean 代码块包裹，包含完整 theorem 声明与证明
+3. 不要使用 sorry 或 admit
+4. 代码块前用一行中文概括证明思路"""
 
 
 # ============ 定理检索：LLM 候选兜底 ============

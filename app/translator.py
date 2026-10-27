@@ -85,8 +85,8 @@ class LeanTranslator:
         self.llm = llm_client
         self.mathlib_context = mathlib_context
 
-    def translate(self, lean_code: str) -> TranslationResult:
-        """执行翻译"""
+    def translate(self, lean_code: str, images: list[str] | None = None) -> TranslationResult:
+        """执行翻译；images 为可选图片 data URL 列表（视觉模型时随请求附带）"""
         if not lean_code or not lean_code.strip():
             return TranslationResult(
                 lean_code=lean_code, markdown="", success=False, error="代码为空"
@@ -94,7 +94,7 @@ class LeanTranslator:
 
         try:
             user_prompt = build_translate_user_prompt(lean_code, self.mathlib_context)
-            response = self.llm.chat(TRANSLATE_SYSTEM_PROMPT, user_prompt, temperature=0.1)
+            response = self.llm.chat(TRANSLATE_SYSTEM_PROMPT, user_prompt, temperature=0.1, images=images)
             md = response.strip()
 
             # 如果 LLM 没有按格式输出（缺标题），补一个兜底

@@ -10,8 +10,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 
 @dataclass
@@ -61,20 +63,30 @@ class LeanCompiler:
         """是否带 Mathlib（仅 lean_ws 模式）"""
         return self._has_ws
 
-    def compile_code(self, lean_code: str) -> CompilationResult:
-        """编译 Lean4 代码字符串"""
-        result, _raw = self.compile_code_raw(lean_code)
+    def compile_code(
+        self,
+        lean_code: str,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> CompilationResult:
+        """编译 Lean4 代码字符串。
+        on_progress(elapsed_seconds) 可选：编译期间心跳回调，参数为已等待秒数。
+        冷加载 Mathlib 首次可能需 10-15 分钟，回调让 UI 显示进度避免卡死感。
+        """
+        result, _raw = self.compile_code_raw(lean_code, on_progress=on_progress)
         return result
 
-    def compile_code_raw(self, lean_code: str) -> tuple[CompilationResult, str]:
-        """编译并返回 (结果, 编译器原始输出)
-
-        原始输出用于需要检查 info 级信息的场景（如 #print axioms）
+    def compile_code_raw(
+        self,
+        lean_code: str,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> tuple[CompilationResult, str]:
+        """编译并返回 (结果, 编译器原始输出)。
+        on_progress(elapsed_seconds) 可选：编译期间心跳回调。
         """
         if self._has_ws:
-            return self._compile_with_ws(lean_code)
+            return self._compile_with_ws(lean_code, on_progress=on_progress)
         if self._lean_bin:
-            return self._compile_real(lean_code)
+            return self._compile_real(lean_code, on_progress=on_progress)
         return self._compile_mock(lean_code)
 
     def parse_output(self, output: str, returncode: int) -> CompilationResult:
@@ -151,38 +163,80 @@ class LeanCompiler:
 
     # ---------- 真实编译（带 Mathlib） ----------
 
-    def _compile_with_ws(self, lean_code: str) -> tuple[CompilationResult, str]:
-        """通过 lake env lean 编译，支持 import Mathlib"""
+    def _compile_with_ws(
+        self,
+        lean_code: str,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> tuple[CompilationResult, str]:
+        """通过 lake env lean 编译，支持 import Mathlib。
+        用 Popen + 轮询实现：编译期间每 5 秒调 on_progress(秒数) 传心跳，
+        冷加载 Mathlib 首次可能需 10-15 分钟，用户不会感觉卡死。
+        """
         tmp_name = f"_tmp_compile_{uuid.uuid4().hex[:8]}.lean"
         tmp_path = os.path.join(self._WS_DIR, tmp_name)
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(lean_code)
 
-            # 首次编译 Mathlib 加载较慢，给 300s
-            # 显式 utf-8 解码：Lean 诊断含 ⊢ ∀ 等 Unicode，Windows 默认 GBK 会解码崩溃
-            proc = subprocess.run(
+            # Popen 非阻塞启动，stdout/stderr 合并到 PIPE
+            # 注意：不指定 text=True/encoding，避免某些 Lean 版本输出二进制字符时崩溃
+            proc = subprocess.Popen(
                 [self._lake_bin, "env", "lean", tmp_name],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=900,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 cwd=self._WS_DIR,
                 env=self._subprocess_env(),
             )
 
-            output = proc.stdout + proc.stderr
+            start = time.time()
+            hard_timeout = 900  # 秒，防极端情况下的无限循环
+            last_heartbeat = -10  # 确保第一轮立刻发一次
+
+            while True:
+                elapsed = int(time.time() - start)
+
+                # 心跳：每 5 秒调一次 on_progress
+                if on_progress and elapsed - last_heartbeat >= 5:
+                    last_heartbeat = elapsed
+                    try:
+                        on_progress(elapsed)
+                    except Exception:
+                        pass
+
+                # 硬超时
+                if elapsed >= hard_timeout:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                    return (
+                        CompilationResult(
+                            success=False,
+                            errors=[f"编译超时（超过 {hard_timeout} 秒）"],
+                            error_explanations=[
+                                "Mathlib 冷缓存首次加载可能需要 10-15 分钟，重试一次即可（系统缓存已预热）；"
+                                "也可能是代码中存在无限循环"
+                            ],
+                        ),
+                        "",
+                    )
+
+                # 检查进程是否结束
+                if proc.poll() is not None:
+                    break
+
+                time.sleep(0.5)
+
+            # 进程结束，一次性拿完整输出
+            try:
+                raw_out, _ = proc.communicate(timeout=30)
+                output = raw_out.decode("utf-8", errors="replace") if raw_out else ""
+            except Exception:
+                output = ""
+
             return self._parse_lean_output(output, proc.returncode), output
-        except subprocess.TimeoutExpired:
-            return (
-                CompilationResult(
-                    success=False,
-                    errors=["编译超时（超过 900 秒）"],
-                    error_explanations=["Mathlib 冷缓存首次加载可能需要 10-15 分钟，重试一次即可（系统缓存已预热）；也可能是代码中存在无限循环"],
-                ),
-                "",
-            )
+
         except Exception as e:
             return (
                 CompilationResult(
@@ -200,7 +254,12 @@ class LeanCompiler:
 
     # ---------- 真实编译（仅核心库） ----------
 
-    def _compile_real(self, lean_code: str) -> tuple[CompilationResult, str]:
+    def _compile_real(
+        self,
+        lean_code: str,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> tuple[CompilationResult, str]:
+        """仅用 lean 核心库编译，不依赖 Mathlib"""
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -209,27 +268,53 @@ class LeanCompiler:
                 f.write(lean_code)
                 tmp_path = f.name
 
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 ["lean", tmp_path],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 cwd=os.path.dirname(tmp_path),
             )
 
-            output = proc.stdout + proc.stderr
+            start = time.time()
+            hard_timeout = 120
+            last_heartbeat = -10
+
+            while True:
+                elapsed = int(time.time() - start)
+                if on_progress and elapsed - last_heartbeat >= 5:
+                    last_heartbeat = elapsed
+                    try:
+                        on_progress(elapsed)
+                    except Exception:
+                        pass
+
+                if elapsed >= hard_timeout:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                    return (
+                        CompilationResult(
+                            success=False,
+                            errors=["编译超时（超过 120 秒）"],
+                            error_explanations=["可能是代码中存在无限循环或递归无法终止"],
+                        ),
+                        "",
+                    )
+
+                if proc.poll() is not None:
+                    break
+
+                time.sleep(0.5)
+
+            try:
+                raw_out, _ = proc.communicate(timeout=10)
+                output = raw_out.decode("utf-8", errors="replace") if raw_out else ""
+            except Exception:
+                output = ""
+
             return self._parse_lean_output(output, proc.returncode), output
-        except subprocess.TimeoutExpired:
-            return (
-                CompilationResult(
-                    success=False,
-                    errors=["编译超时（超过 30 秒）"],
-                    error_explanations=["可能是代码中存在无限循环或递归无法终止"],
-                ),
-                "",
-            )
         except Exception as e:
             return (
                 CompilationResult(

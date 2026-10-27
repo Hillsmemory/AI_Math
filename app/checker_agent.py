@@ -102,24 +102,48 @@ class ProofChecker:
 
     # ---------- 主入口 ----------
 
-    def check(self, lean_code: str, use_llm_review: bool = False) -> CheckResult:
-        """执行完整检查清单"""
+    def check(self, lean_code: str, use_llm_review: bool = False,
+              images: list[str] | None = None,
+              on_progress=None) -> CheckResult:
+        """执行完整检查清单。
+
+        on_progress(status, detail=None) 可选的进度回调：
+          - status="static"    静态检查开始
+          - status="compiling" 编译开始（detail 非 None 时为其心跳秒数）
+          - status="llm"       LLM 审查开始
+        images 供可选 LLM 审查附带图片（视觉模型）
+        """
         items: list[CheckItem] = []
         code = lean_code or ""
 
-        # 1. 静态检查清单（始终执行）
+        # 1. 静态检查清单（始终执行，纯正则，秒级）
+        if on_progress:
+            on_progress("static")
         items.append(self._check_theorem_decl(code))
         items.append(self._check_sorry(code))
         items.append(self._check_brackets(code))
         items.append(self._check_import_consistency(code))
 
         # 2. 真实编译 + axiom 深度检查（有 Lean 时）
+        #    合并为「一次」编译：直接附加 #print axioms，
+        #    同一次 Mathlib 加载即可同时拿到编译结果和 axiom 依赖，避免重复编译两遍。
         compilation: Optional[CompilationResult] = None
         if self.compiler.available:
-            compilation = self.compiler.compile_code(code)
+            if on_progress:
+                on_progress("compiling")
+
+            def _hb(secs: int):
+                if on_progress:
+                    on_progress("compiling", secs)
+
+            # 附加 #print axioms 后一次编译（即使原代码编译失败，#print 也不影响错误定位）
+            names = self._THEOREM_RE.findall(code)
+            augmented = code.rstrip() + "\n\n" + "\n".join(f"#print axioms {n}" for n in names) + "\n"
+            compilation, raw = self.compiler.compile_code_raw(augmented, on_progress=_hb)
+
             if compilation.success:
                 items.append(CheckItem("真实编译", True, LEVEL_PASS, "Lean 编译器验证通过"))
-                items.append(self._check_axioms(code))
+                items.append(self._parse_axioms_entry(raw, names))
             else:
                 items.append(CheckItem(
                     "真实编译", False, LEVEL_ERROR,
@@ -135,7 +159,9 @@ class ProofChecker:
         # 3. 可选 LLM 深度审查
         llm_review = ""
         if use_llm_review and self.llm is not None:
-            llm_review = self._llm_review(code)
+            if on_progress:
+                on_progress("llm")
+            llm_review = self._llm_review(code, images)
 
         n_pass = sum(1 for i in items if i.level == LEVEL_PASS)
         n_error = sum(1 for i in items if i.level == LEVEL_ERROR)
@@ -219,19 +245,16 @@ class ProofChecker:
 
     # ---------- axiom 深度检查 ----------
 
-    def _check_axioms(self, code: str) -> CheckItem:
-        """通过 #print axioms 检查是否依赖 sorryAx（伪证明）
+    def _parse_axioms_entry(self, raw: str, names: list[str]) -> CheckItem:
+        """解析带 #print axioms 的编译原始输出，检查是否依赖 sorryAx（伪证明）。
 
         原理：sorry 能让编译通过，但任何依赖 sorry 的定理在 #print axioms
         输出中会出现 sorryAx。这是编译检查无法发现的"漏网之鱼"。
+        （编译本身已在 check() 里完成，这里只做输出解析，避免重复编译。）
         """
-        names = self._THEOREM_RE.findall(code)
         if not names:
             return CheckItem("axiom 深度检查", True, LEVEL_INFO, "未找到 theorem/lemma 声明，跳过")
 
-        # 附加 #print axioms 后重新编译（注：namespace 内的定理需全限定名，此处用裸名，MVP 可接受）
-        augmented = code.rstrip() + "\n\n" + "\n".join(f"#print axioms {n}" for n in names) + "\n"
-        _result, raw = self.compiler.compile_code_raw(augmented)
         if not raw:
             return CheckItem("axiom 深度检查", True, LEVEL_INFO, "无法获取编译器输出，跳过 axiom 检查")
 
@@ -255,10 +278,10 @@ class ProofChecker:
 
     # ---------- LLM 审查 ----------
 
-    def _llm_review(self, code: str) -> str:
+    def _llm_review(self, code: str, images: list[str] | None = None) -> str:
         """调用 LLM 做深度审查，返回 markdown 报告"""
         try:
-            resp = self.llm.chat(REVIEW_SYSTEM_PROMPT, build_review_user_prompt(code), temperature=0.1)
+            resp = self.llm.chat(REVIEW_SYSTEM_PROMPT, build_review_user_prompt(code), temperature=0.1, images=images)
             return resp.strip()
         except Exception as e:
             return f"> ⚠️ LLM 审查失败：{e}"
