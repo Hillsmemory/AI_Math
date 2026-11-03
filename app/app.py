@@ -13,10 +13,13 @@ Tab5 定理检索与形式化：本地知识库加权检索 → LLM 候选兜底
 """
 
 import base64
+import hashlib
 import json
 import os
+import re
 import sys
 import threading
+import time
 
 import pandas as pd
 import streamlit as st
@@ -50,6 +53,75 @@ from prompts import (
 )
 from theorem_kb import TheoremEntry, get_entry, search_theorems
 from translator import LeanTranslator, get_demo_translation
+
+
+# ============ 导出与 .lean 文件落盘 ============
+
+# 导出证明专用目录：位于 lean-playground 项目内，天然复用其 Lake 环境与 Mathlib 缓存。
+# 用 VS Code 以「lean-playground」文件夹为工作区（Open Folder）打开，其中的 .lean 即可直接 `import Mathlib` 验证。
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXPORTS_DIR = os.path.join(_BASE_DIR, "exports")
+
+_EXPORT_NAME_SYSTEM = (
+    "你是 Lean4 专家。请根据给定的定理声明与证明，起一个简洁、规范的英文文件名"
+    "（小写蛇形命名，例如 chain_rule、add_comm、even_square_div4）。"
+    "只输出文件名本身，不要 .lean 后缀，不要反引号、代码围栏、解释或其他任何多余字符。"
+)
+
+
+def _sanitize_lean_filename(name: str) -> str:
+    """把任意字符串清洗成合法 .lean 文件名（不含扩展名），非法时回退 'proof'。"""
+    name = (name or "").strip().strip("`").strip()
+    name = name.split("\n")[0].strip()
+    name = re.sub(r"[^0-9A-Za-z_\-]+", "_", name)
+    name = name.strip("._-")
+    return name or "proof"
+
+
+def _default_lean_name(code: str) -> str:
+    """从定理名提取文件名，提取不到则用时间戳兜底。"""
+    m = re.search(r"\b(?:theorem|lemma|example|def)\s+([A-Za-z_][\w']*)", code)
+    if m:
+        return _sanitize_lean_filename(m.group(1))
+    return "proof_" + time.strftime("%Y%m%d_%H%M%S")
+
+
+def _name_from_llm(code: str, llm) -> str | None:
+    """让大模型给证明命名；联系不到或返回异常时返回 None。"""
+    if llm is None:
+        return None
+    try:
+        out = llm.chat(_EXPORT_NAME_SYSTEM, "定理代码：\n```lean\n" + code[:2000] + "\n```")
+    except Exception:
+        return None
+    return _sanitize_lean_filename(out)
+
+
+def _resolve_lean_export_name(code: str) -> str:
+    """解析导出文件名：优先大模型命名，失败回退默认名；结果按内容哈希缓存。"""
+    key = "lean_export_name_" + hashlib.md5(code.encode("utf-8")).hexdigest()
+    name = st.session_state.get(key)
+    if not name:
+        llm = None
+        try:
+            if api_key:
+                llm = LLMClient.from_preset(model_name, api_key=api_key)
+        except Exception:
+            llm = None
+        name = _name_from_llm(code, llm) if llm else None
+        if not name:
+            name = _default_lean_name(code)
+        st.session_state[key] = name
+    return name
+
+
+def _save_lean_export(name: str, code: str) -> str:
+    """把证明写入 exports 目录，返回绝对路径。"""
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    path = os.path.join(EXPORTS_DIR, name + ".lean")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code)
+    return path
 
 
 # ============ 页面配置 ============
@@ -170,7 +242,7 @@ def image_uploader(key: str, model: str) -> list[str]:
     if not model_supports_vision(model):
         st.warning(
             f"当前模型 **{model}** 不支持读取图片，已上传的图片将被忽略。"
-            "如需读图，请在侧边栏改用 GPT-4o / GPT-4o Mini 或 Qwen VL Max（视觉）。",
+            "如需读图，请在侧边栏改用支持视觉的模型（DeepSeek Flash / GPT-4o / Qwen VL Max 等）。",
             icon="🖼️",
         )
         return []
@@ -660,12 +732,16 @@ with tab_gen:
 
         col_dl, col_tr = st.columns([1, 1])
         with col_dl:
+            _code = result.final_code
+            _name = _resolve_lean_export_name(_code)
+            _save_lean_export(_name, _code)
             st.download_button(
                 label="📥 导出为 .lean 文件",
-                data=result.final_code,
-                file_name="proof.lean",
+                data=_code,
+                file_name=_name + ".lean",
                 mime="text/plain",
             )
+            st.caption(f"已保存到 `exports/{_name}.lean`，用 VS Code 打开 lean-playground 文件夹即可验证")
         with col_tr:
             st.caption("💡 可在「证明检查」Tab 一键填充此结果做深度检查")
 
@@ -1377,8 +1453,11 @@ with tab_theorem:
         else:
             st.warning("⚠️ 经过多轮修正仍未通过编译，可查看各轮报错", icon="⚠️")
         st.code(form["code"], language="lean")
-        st.download_button("📥 导出为 .lean 文件", data=form["code"],
-                           file_name="statement.lean", mime="text/plain")
+        _code5 = form["code"]
+        _name5 = _resolve_lean_export_name(_code5)
+        _save_lean_export(_name5, _code5)
+        st.download_button("📥 导出为 .lean 文件", data=_code5,
+                           file_name=_name5 + ".lean", mime="text/plain")
         for it in form["rounds"]:
             title = f"第 {it['round']} 轮 " + ("✅ 编译通过" if it["ok"] else f"❌ {len(it['errors'])} 个错误")
             with st.expander(title, expanded=(not it["ok"])):

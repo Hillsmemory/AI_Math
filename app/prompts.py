@@ -504,3 +504,82 @@ def build_formalize_fix_prompt(prev_code: str, errors: list[str]) -> str:
 2. 仍然只允许引用之前提供的已验证定理名
 3. 证明体保持 `by sorry`
 4. 输出一行中文修复说明 + ```lean 代码块```"""
+
+
+# ============ 评测：给定形式化陈述，补全证明（路径 A） ============
+
+PROOF_COMPLETION_SYSTEM = """你是一名 Lean4 定理证明专家，任务是「补全证明体」：输入是一行已经写好的 `theorem ... := by`，你只输出 `:= by` 之后的那几行 tactic。
+
+## 铁律（违反必编译报错）
+1. 输出里**禁止出现** `theorem` / `lemma` / `def` / `example` / `import` / `:=` / `by` 这些词——它们已在输入里，重复输出会得到「unexpected identifier; expected command」错误。
+2. 只输出 tactic 序列本身，例如 `exact ...`、`apply ...`、`rw [...]`、`simp`、`ring`、`omega`、`norm_num`、`linarith`、`tauto`、`aesop`、`intro h`、`ext x`、`constructor`。
+3. 禁止 `sorry` / `admit`。
+4. 引理名必须真实存在；拿不准就用 `omega` / `ring` / `tauto` / `simp` / `aesop` 这类不依赖具体引理名的 tactic。
+
+## 输出格式
+只输出一个 ```lean 代码块，代码块内就是那几行 tactic；不要 `theorem`、不要 `import`、不要任何解释文字。"""
+
+
+def build_proof_completion_prompt(formal_statement: str, header: str = "", nl: str = "") -> str:
+    """构造「补全证明」的首轮用户提示词（含 few-shot 示例，强约束输出格式）。"""
+    nl_block = f"## 自然语言题面\n{nl.strip()}\n\n" if nl and nl.strip() else ""
+    header_block = f"## 依赖环境（已提供，无需重复）\n```lean\n{header.strip()}\n```\n\n" if header and header.strip() else ""
+    return f"""请补全下面这个 Lean4 定理的证明体。
+
+{nl_block}{header_block}## 你要做什么（务必照做）
+
+下面给出的是一行**已经写好**的定理声明（以 `:= by` 结尾）。你的唯一任务是输出 `:= by` **之后**的那几行 tactic，别的一字不写。
+
+- 输出里**绝不能出现** `theorem` / `lemma` / `def` / `import` / `:= by` / `by` —— 它们已经在上面给过了，再写一遍就编译报错。
+- 只写 tactic：`exact` / `apply` / `rw` / `simp` / `ring` / `omega` / `norm_num` / `linarith` / `tauto` / `aesop` / `intro` / `ext` / `constructor` 等。
+- 禁止 `sorry` / `admit`。
+
+## 三个正确示例（左边输入 → 右边是你该输出的全部内容）
+
+【例1】输入：`theorem t (p q : Prop) : p ∧ q → q ∧ p := by`
+输出：
+```lean
+intro h
+exact ⟨h.2, h.1⟩
+```
+
+【例2】输入：`theorem t (a b : ℕ) : a + b = b + a := by`
+输出：
+```lean
+exact Nat.add_comm a b
+```
+
+【例3】输入：`theorem t (a b : ℤ) : (a + b)^2 = a^2 + 2 * a * b + b^2 := by`
+输出：
+```lean
+ring
+```
+
+## 现在要你证明的这条
+
+```lean
+{formal_statement.strip()}
+```
+
+只输出一个 ```lean 代码块，代码块里只有该定理的证明体（几行 tactic），不要任何其它文字。"""
+
+
+def build_proof_refine_prompt(prev_proof: str, errors: list[str]) -> str:
+    """构造「补全证明」的修正轮提示词（基于编译报错反馈）"""
+    err_text = "\n".join(f"- {e}" for e in errors) if errors else "（无明确错误行）"
+    return f"""上面补全的证明编译失败了，请根据报错修复。
+
+## 上次补全的证明体
+```lean
+{prev_proof}
+```
+
+## 编译报错
+{err_text}
+
+## 修复要求
+1. 仔细分析每个报错，理解原因（类型不匹配/未知引理/未闭合目标等）
+2. 只修改并重新输出 `:= by` 之后的证明体，不要改动 theorem 声明
+3. 禁止使用 sorry / admit
+4. 引理名必须真实存在，不确定时改用更基础、更可靠的 tactic
+5. 输出格式：一个 ```lean 代码块```，代码块内只有证明体"""

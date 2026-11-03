@@ -1,0 +1,69 @@
+{
+  "model": "deepseek-chat",
+  "dataset": "simple_arith.jsonl",
+  "max_rounds": 3,
+  "total": 5,
+  "single_pass": 0,
+  "loop_pass": 0,
+  "single_pass_rate": 0.0,
+  "loop_pass_rate": 0.0,
+  "avg_rounds": 0,
+  "single_fail_reasons": {
+    "type_mismatch": 5
+  },
+  "loop_fail_reasons": {
+    "type_mismatch": 5
+  },
+  "details": [
+    {
+      "id": "eval_add_comm_nat",
+      "benchmark": "SimpleArith",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 166.6
+    },
+    {
+      "id": "eval_add_assoc_nat",
+      "benchmark": "SimpleArith",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 108.0
+    },
+    {
+      "id": "eval_add_zero_nat",
+      "benchmark": "SimpleArith",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 129.8
+    },
+    {
+      "id": "eval_mul_zero_int",
+      "benchmark": "SimpleArith",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 145.3
+    },
+    {
+      "id": "eval_square_sum_int",
+      "benchmark": "SimpleArith",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 137.9
+    }
+  ]
+}
