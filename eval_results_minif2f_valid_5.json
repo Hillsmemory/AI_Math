@@ -1,0 +1,74 @@
+{
+  "model": "deepseek-chat",
+  "dataset": "minif2f_valid.jsonl",
+  "max_rounds": 3,
+  "total": 5,
+  "single_pass": 0,
+  "loop_pass": 0,
+  "single_pass_rate": 0.0,
+  "loop_pass_rate": 0.0,
+  "avg_rounds": 0,
+  "single_fail_reasons": {
+    "timeout": 1,
+    "unknown_identifier": 1,
+    "unsolved_goals": 1,
+    "type_mismatch": 2
+  },
+  "loop_fail_reasons": {
+    "timeout": 1,
+    "unknown_identifier": 1,
+    "type_mismatch": 3
+  },
+  "details": [
+    {
+      "id": "aimeII_2001_p3",
+      "benchmark": "miniF2F",
+      "single_pass": false,
+      "single_reason": "timeout",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "timeout",
+      "elapsed": 2747.2
+    },
+    {
+      "id": "aimeII_2020_p6",
+      "benchmark": "miniF2F",
+      "single_pass": false,
+      "single_reason": "unknown_identifier",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "unknown_identifier",
+      "elapsed": 100.4
+    },
+    {
+      "id": "aimeI_2000_p7",
+      "benchmark": "miniF2F",
+      "single_pass": false,
+      "single_reason": "unsolved_goals",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 69.9
+    },
+    {
+      "id": "aime_1983_p9",
+      "benchmark": "miniF2F",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 65.4
+    },
+    {
+      "id": "aime_1984_p15",
+      "benchmark": "miniF2F",
+      "single_pass": false,
+      "single_reason": "type_mismatch",
+      "loop_pass": false,
+      "final_rounds": 3,
+      "loop_reason": "type_mismatch",
+      "elapsed": 68.2
+    }
+  ]
+}

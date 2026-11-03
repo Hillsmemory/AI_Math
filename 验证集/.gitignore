@@ -1,0 +1,10 @@
+# 上游原始仓库仅本地用于构建，不入库
+CombiBench/
+FormalMATH-Bench/
+FormalMATH-Lite/
+MathOlympiadBench/
+miniF2F/
+miniF2F-lean4/
+miniF2F_v2/
+ProofNet-lean4/
+PutnamBench/

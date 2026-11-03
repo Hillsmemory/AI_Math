@@ -31,6 +31,13 @@ PRESET_MODELS = {
         "env_key": "DEEPSEEK_API_KEY",
         "vision": False,
     },
+    # DeepSeek 视觉模型（deepseek-flash 支持文本+图片输入，旧名 deepseek-v4-flash-vision-exp 已下线）
+    "deepseek-flash": {
+        "label": "DeepSeek Flash（视觉）",
+        "base_url": "https://api.deepseek.com",
+        "env_key": "DEEPSEEK_API_KEY",
+        "vision": True,
+    },
     # Qwen (DashScope OpenAI 兼容)
     "qwen-plus": {
         "label": "Qwen Plus",
@@ -159,12 +166,15 @@ class LLMClient:
                     return resp.choices[0].message.content or ""
                 except Exception as e:
                     msg = str(e)
-                    # 限流/并发超限/超时：等待后自动重试
-                    if ("429" in msg or "rate_limit" in msg or "concurrency" in msg
-                            or "timed out" in msg.lower() or "timeout" in msg.lower()):
+                    # 限流/并发超限：这是可恢复的瞬时错误，等待后自动重试
+                    if "429" in msg or "rate_limit" in msg or "concurrency" in msg:
                         last_err = e
                         time.sleep(3 * (attempt + 1))
                         continue
+                    # 超时：通常是模型本身推理过慢（如 K2 推理模型），重试不会更快，
+                    # 直接失败可避免每个请求白等 4×超时时长
+                    if "timed out" in msg.lower() or "timeout" in msg.lower():
+                        raise
                     raise
         raise last_err
 

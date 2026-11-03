@@ -1,0 +1,65 @@
+{
+  "model": "deepseek-chat",
+  "dataset": "simple_logic.jsonl",
+  "max_rounds": 3,
+  "total": 5,
+  "single_pass": 5,
+  "loop_pass": 5,
+  "single_pass_rate": 1.0,
+  "loop_pass_rate": 1.0,
+  "avg_rounds": 1.0,
+  "single_fail_reasons": {},
+  "loop_fail_reasons": {},
+  "details": [
+    {
+      "id": "eval_and_comm",
+      "benchmark": "SimpleLogic",
+      "single_pass": true,
+      "single_reason": "",
+      "loop_pass": true,
+      "final_rounds": 1,
+      "loop_reason": "",
+      "elapsed": 21.4
+    },
+    {
+      "id": "eval_and_assoc",
+      "benchmark": "SimpleLogic",
+      "single_pass": true,
+      "single_reason": "",
+      "loop_pass": true,
+      "final_rounds": 1,
+      "loop_reason": "",
+      "elapsed": 23.3
+    },
+    {
+      "id": "eval_or_comm",
+      "benchmark": "SimpleLogic",
+      "single_pass": true,
+      "single_reason": "",
+      "loop_pass": true,
+      "final_rounds": 1,
+      "loop_reason": "",
+      "elapsed": 33.5
+    },
+    {
+      "id": "eval_and_self",
+      "benchmark": "SimpleLogic",
+      "single_pass": true,
+      "single_reason": "",
+      "loop_pass": true,
+      "final_rounds": 1,
+      "loop_reason": "",
+      "elapsed": 26.6
+    },
+    {
+      "id": "eval_contrapositive",
+      "benchmark": "SimpleLogic",
+      "single_pass": true,
+      "single_reason": "",
+      "loop_pass": true,
+      "final_rounds": 1,
+      "loop_reason": "",
+      "elapsed": 28.0
+    }
+  ]
+}

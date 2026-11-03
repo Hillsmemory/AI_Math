@@ -1,0 +1,6 @@
+{"id":"eval_and_comm","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p 和 q，若 p 且 q，则 q 且 p。","formal_statement":"theorem eval_and_comm (p q : Prop) : p ∧ q → q ∧ p := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_and_assoc","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p、q、r，有 (p ∧ q) ∧ r 与 p ∧ (q ∧ r) 等价。","formal_statement":"theorem eval_and_assoc (p q r : Prop) : (p ∧ q) ∧ r ↔ p ∧ (q ∧ r) := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_or_comm","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p 和 q，若 p 或 q，则 q 或 p。","formal_statement":"theorem eval_or_comm (p q : Prop) : p ∨ q → q ∨ p := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_and_self","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p，有 p 且 p 等价于 p。","formal_statement":"theorem eval_and_self (p : Prop) : p ∧ p ↔ p := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_contrapositive","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p 和 q，若 p 蕴含 q，则非 q 蕴含非 p。","formal_statement":"theorem eval_contrapositive (p q : Prop) : (p → q) → (¬ q → ¬ p) := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_imp_self","benchmark":"SimpleLogic","split":"all","nl":"证明：对任意命题 p，有 p 蕴含 p。","formal_statement":"theorem eval_imp_self (p : Prop) : p → p := by","header":"import Mathlib\nimport Aesop\n"}

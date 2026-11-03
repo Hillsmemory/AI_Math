@@ -1,0 +1,6 @@
+{"id":"eval_add_comm_nat","benchmark":"SimpleArith","split":"all","nl":"证明：对任意自然数 a、b，有 a + b = b + a。","formal_statement":"theorem eval_add_comm_nat (a b : ℕ) : a + b = b + a := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_add_assoc_nat","benchmark":"SimpleArith","split":"all","nl":"证明：对任意自然数 a、b、c，有 (a + b) + c = a + (b + c)。","formal_statement":"theorem eval_add_assoc_nat (a b c : ℕ) : (a + b) + c = a + (b + c) := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_add_zero_nat","benchmark":"SimpleArith","split":"all","nl":"证明：对任意自然数 n，有 n + 0 = n。","formal_statement":"theorem eval_add_zero_nat (n : ℕ) : n + 0 = n := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_mul_zero_int","benchmark":"SimpleArith","split":"all","nl":"证明：对任意整数 a，有 a * 0 = 0。","formal_statement":"theorem eval_mul_zero_int (a : ℤ) : a * 0 = 0 := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_square_sum_int","benchmark":"SimpleArith","split":"all","nl":"证明：对任意整数 a、b，有 (a + b)^2 = a^2 + 2ab + b^2。","formal_statement":"theorem eval_square_sum_int (a b : ℤ) : (a + b)^2 = a^2 + 2 * a * b + b^2 := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_two_plus_two","benchmark":"SimpleArith","split":"all","nl":"证明：2 + 2 = 4。","formal_statement":"theorem eval_two_plus_two : (2 : ℕ) + 2 = 4 := by","header":"import Mathlib\nimport Aesop\n"}

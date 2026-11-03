@@ -1,0 +1,5 @@
+{"id":"eval_union_comm_set","benchmark":"SimpleSet","split":"all","nl":"证明：对任意集合 A、B，有 A ∪ B = B ∪ A。","formal_statement":"theorem eval_union_comm_set {α : Type*} (A B : Set α) : A ∪ B = B ∪ A := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_inter_comm_set","benchmark":"SimpleSet","split":"all","nl":"证明：对任意集合 A、B，有 A ∩ B = B ∩ A。","formal_statement":"theorem eval_inter_comm_set {α : Type*} (A B : Set α) : A ∩ B = B ∩ A := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_inter_self_set","benchmark":"SimpleSet","split":"all","nl":"证明：对任意集合 A，有 A ∩ A = A。","formal_statement":"theorem eval_inter_self_set {α : Type*} (A : Set α) : A ∩ A = A := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_union_self_set","benchmark":"SimpleSet","split":"all","nl":"证明：对任意集合 A，有 A ∪ A = A。","formal_statement":"theorem eval_union_self_set {α : Type*} (A : Set α) : A ∪ A = A := by","header":"import Mathlib\nimport Aesop\n"}
+{"id":"eval_subset_refl_set","benchmark":"SimpleSet","split":"all","nl":"证明：对任意集合 A，有 A ⊆ A。","formal_statement":"theorem eval_subset_refl_set {α : Type*} (A : Set α) : A ⊆ A := by","header":"import Mathlib\nimport Aesop\n"}
